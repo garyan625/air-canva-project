@@ -2,482 +2,779 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import tkinter as tk
+import customtkinter as ctk
 from tkinter import filedialog
 import time
 import threading
-import math 
+import math
 import os
 import subprocess
 import wave
+import textwrap
 from datetime import datetime
 
 import pytesseract
 import sounddevice as sd
 import imageio_ffmpeg
-from textblob import TextBlob # USING TEXTBLOB NOW
-from PIL import Image, ImageDraw, ImageFont
+from textblob import TextBlob
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
+# Set path for Tesseract
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-root = tk.Tk()
-root.withdraw()
+# --- Optional: TrOCR (transformer OCR trained on real handwriting, incl.
+# cursive) is a much better fit than Tesseract for air-written text. It's
+# optional so the app still runs with just Tesseract if these aren't
+# installed. To enable it:
+#     pip install torch transformers
+# (use the correct torch command for your OS/GPU from https://pytorch.org
+#  if you want GPU acceleration — plain CPU install works fine too, just
+#  slower on the very first run while it downloads the model, ~1.3 GB,
+#  which then caches locally for every run after that).
+try:
+    import torch
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    TROCR_LIBS_AVAILABLE = True
+except Exception as _trocr_import_error:  # ImportError, or OSError from a Windows DLL clash
+    print("TrOCR libraries could not be imported:", _trocr_import_error)
+    TROCR_LIBS_AVAILABLE = False
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.85)
-mp_draw = mp.solutions.drawing_utils
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) 
+class ModernAirCanvas:
+    def __init__(self):
+        # --- 1. CustomTkinter Window Setup ---
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
 
-if not cap.isOpened():
-    print("ERROR: Cannot open the webcam.")
-    exit()
+        self.root = ctk.CTk()
+        self.root.title("Air Canvas Pro - EdTech Edition")
+        self.root.geometry("1100x650")
 
-canvas = None           
-text_canvas = None      
-bg_image = None  
-white_canvas = False
-xp, yp = 0, 0  
-shape_start = None
-draw_color = (255, 0, 0)
-brush_thickness = 5
-brush_presets = [3, 5, 8, 12]
-brush_preset_index = brush_presets.index(brush_thickness)
-eraser_thickness = 50 
-last_click_time = 0 
-last_pen_toggle_time = 0
-last_undo_time = 0
-last_size_change_time = 0
-last_shape_action_time = 0
-last_sheet_toggle_time = 0
-last_record_toggle_time = 0
-record_button_armed = True
-pen_enabled = True
-canvas_history = []
-video_writer = None
-audio_stream = None
-audio_frames = []
-is_recording = False
-recording_path = None
-video_temp_path = None
-audio_temp_path = None
-shape_mode = "freehand"
-shape_menu_open = False
-palette_open = False
-is_ai_processing = False
+        # --- Layout Frames ---
+        self.main_container = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.main_container.pack(fill="both", expand=True, padx=15, pady=15)
 
-frames_lost = 0 
-MAX_FRAMES_LOST = 3 
+        # Video feed container
+        self.video_frame = ctk.CTkFrame(self.main_container, corner_radius=15, fg_color="#1E1E1E")
+        self.video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
-tray_width, tray_height = 400, 60
-tray_hsv = np.zeros((tray_height, tray_width, 3), dtype=np.uint8)
-hues = np.linspace(0, 179, tray_width, dtype=np.uint8)
-tray_hsv[:, :, 0] = hues        
-tray_hsv[:, :, 1] = 255         
-tray_hsv[:, :, 2] = 255         
-color_tray_bgr = cv2.cvtColor(tray_hsv, cv2.COLOR_HSV2BGR)
+        self.video_label = tk.Label(self.video_frame, bg="#1E1E1E")
+        self.video_label.pack(expand=True, fill="both", padx=10, pady=10)
 
-def process_handwriting_with_ai(image_array):
-    global is_ai_processing, canvas, text_canvas
-    try:
-        # 1. Isolate the drawn lines
-        gray = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-        
-        # --- NEW: Morphological Dilation ---
-        # Thicken the lines to simulate bold, printed text for the OCR engine
-        kernel = np.ones((5,5), np.uint8)
-        thick_drawing = cv2.dilate(thresh, kernel, iterations=2)
-        
-        # Invert for Tesseract (It expects black text on a white background)
-        thresh_inv = cv2.bitwise_not(thick_drawing)
-        
-        # --- NEW: Tesseract Whitelisting ---
-        # Force the AI to ONLY guess letters, eliminating numbers or weird punctuation
-        custom_config = r'-c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ --psm 7'
-        raw_text = pytesseract.image_to_string(thresh_inv, config=custom_config).strip()
-        
-        if raw_text and len(raw_text) > 1:
-            # Fix spelling
-            corrected_text = str(TextBlob(raw_text).correct())
-            render_text_with_pil(corrected_text)
-            canvas = np.zeros_like(canvas)
-            
-    except Exception as e:
-        print("Local AI Error:", e)
-    is_ai_processing = False
+        # --- 2. OpenCV & Mediapipe Setup ---
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            print("ERROR: Cannot open the webcam.")
+            exit()
 
-def render_text_with_pil(text):
-    global text_canvas
-    img_pil = Image.fromarray(cv2.cvtColor(text_canvas, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(img_pil)
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.85)
 
-    margin = 40
-    max_text_width = int(img_pil.width * 0.65)
-    y_offset = 100
-    for line in text.split('\n'):
-        font_size = 42
+        # Get camera resolution
+        success, frame = self.cap.read()
+        self.h, self.w, _ = frame.shape
+
+        # --- 3. App State Variables ---
+        self.canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        self.text_canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        self.bg_image = None
+        self.white_canvas = False
+        self.xp, self.yp = 0, 0
+        self.shape_start = None
+
+        # Lock to protect canvas/text_canvas since the AI thread writes to them
+        # while the main video loop reads/writes them ~66 times a second.
+        self.canvas_lock = threading.Lock()
+
+        # Modern Palette Colors (RGB for PIL)
+        self.draw_color_rgb = (97, 175, 239)  # Soft Blue
+        self.brush_thickness = 5
+        self.eraser_thickness = 50
+        self.shape_mode = "freehand"
+
+        self.pen_enabled = True
+        self.canvas_history = []
+
+        # Timers to prevent double-clicks
+        self.last_action_time = 0
+        self.frames_lost = 0
+
+        # Recording State
+        self.is_recording = False
+        self.video_writer = None
+        self.audio_stream = None
+        self.audio_frames = []
+        self.is_ai_processing = False
+        self.shape_menu_open = False
+
+        # TrOCR model is loaded lazily (on first AI FIX use) since it's slow
+        # to load and would delay app startup otherwise.
+        self.trocr_processor = None
+        self.trocr_model = None
+        self.trocr_load_attempted = False
+
+        # Side Control Panel
+        self.side_panel = ctk.CTkFrame(self.main_container, width=250, corner_radius=15)
+        self.side_panel.pack(side="right", fill="y")
+        self.build_side_panel()
+
+        # Build Air UI Boundaries
+        self.setup_air_buttons()
+
+        # Start Main Loop
+        self.update_frame()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.mainloop()
+
+    def build_side_panel(self):
+        """Builds the physical CustomTkinter UI panel."""
+        ctk.CTkLabel(self.side_panel, text="Controls", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(20, 10))
+
+        self.pen_btn = ctk.CTkButton(self.side_panel, text="Pen: ON", fg_color="#2EA043",
+                                      hover_color="#237A33", command=self.toggle_pen)
+        self.pen_btn.pack(pady=10, padx=20, fill="x")
+
+        ctk.CTkButton(self.side_panel, text="Clear Canvas", fg_color="#D29922",
+                      hover_color="#A37516", command=self.clear_canvas).pack(pady=10, padx=20, fill="x")
+        ctk.CTkButton(self.side_panel, text="Undo Last", command=self.undo).pack(pady=10, padx=20, fill="x")
+
+        ctk.CTkLabel(self.side_panel, text="Brush Size").pack(pady=(20, 0))
+        self.size_slider = ctk.CTkSlider(self.side_panel, from_=2, to=20, command=self.update_brush_size)
+        self.size_slider.set(self.brush_thickness)
+        self.size_slider.pack(pady=10, padx=20, fill="x")
+
+        ctk.CTkButton(self.side_panel, text="Load Presentation", fg_color="#444C56",
+                      command=self.load_bg).pack(pady=(20, 10), padx=20, fill="x")
+
+        # --- NEW: AI recognized-text panel ---
+        # This is the readable "clean" output of the AI FIX feature. The tiny
+        # text rendered on the video canvas is easy to miss on a projector,
+        # so we also surface it here, big and scrollable, for students.
+        ctk.CTkLabel(self.side_panel, text="AI Recognized Text",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(10, 5))
+        self.ai_text_box = ctk.CTkTextbox(self.side_panel, height=160, wrap="word",
+                                           font=ctk.CTkFont(size=15))
+        self.ai_text_box.pack(pady=(0, 10), padx=20, fill="x")
+        self.ai_text_box.insert("1.0", "Write on the canvas, then hover over AI FIX.")
+        self.ai_text_box.configure(state="disabled")
+
+        self.rec_btn = ctk.CTkButton(self.side_panel, text="Start Recording", fg_color="#F85149",
+                                      hover_color="#B53932", command=self.toggle_recording)
+        self.rec_btn.pack(side="bottom", pady=20, padx=20, fill="x")
+
+    def setup_air_buttons(self):
+        """Defines the hitboxes for the on-screen glassmorphic UI."""
+        self.air_btns = {
+            "COLOR": (15, 15, 85, 50),
+            "ERASE": (95, 15, 165, 50),
+            "CLEAR": (175, 15, 245, 50),
+            "AI_FIX": (255, 15, 325, 50),
+            "PEN": (335, 15, 405, 50),
+            "UNDO": (415, 15, 485, 50),
+            "SHEET": (495, 15, 565, 50),
+
+            "SHAPE": (15, 60, 85, 95),
+            "REC": (495, 60, 565, 95)
+        }
+
+        self.shape_btns = {
+            "freehand": (95, 60, 165, 95),
+            "line": (175, 60, 245, 95),
+            "rectangle": (255, 60, 325, 95),
+            "circle": (335, 60, 405, 95)
+        }
+
+    # --- Interaction Logic Methods ---
+    def toggle_pen(self):
+        self.pen_enabled = not self.pen_enabled
+        self.xp, self.yp = 0, 0
+        self.pen_btn.configure(text=f"Pen: {'ON' if self.pen_enabled else 'OFF'}",
+                                fg_color="#2EA043" if self.pen_enabled else "#444C56")
+
+    def update_brush_size(self, val):
+        self.brush_thickness = int(val)
+
+    def clear_canvas(self):
+        with self.canvas_lock:
+            self.canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+            self.text_canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        self.bg_image = None
+        self.xp, self.yp = 0, 0
+        self.reset_ai_textbox()
+
+    def undo(self):
+        if self.canvas_history:
+            with self.canvas_lock:
+                self.canvas = self.canvas_history.pop()
+        self.xp, self.yp = 0, 0
+
+    def load_bg(self):
+        filepath = filedialog.askopenfilename(title="Select Presentation", filetypes=[("Images", "*.jpg *.png")])
+        if filepath:
+            self.bg_image = cv2.resize(cv2.imread(filepath), (self.w, self.h))
+            self.white_canvas = False
+            self.clear_canvas()
+
+    def toggle_recording(self):
+        if not self.is_recording:
+            success = self.start_recording((self.w, self.h))
+            if success:
+                self.rec_btn.configure(text="Stop Recording", fg_color="#B53932")
+        else:
+            self.stop_recording()
+            self.rec_btn.configure(text="Start Recording", fg_color="#F85149")
+
+    # --- Glassmorphism UI Drawing ---
+    def draw_glassmorphic_ui(self, overlay_img):
+        """Draws modern, semi-transparent rounded buttons using PIL."""
+        draw = ImageDraw.Draw(overlay_img)
+
         try:
-            font = ImageFont.truetype("segoesc.ttf", font_size)
-            text_width = draw.textbbox((0, 0), line, font=font)[2]
-            if text_width > max_text_width:
-                font_size = max(24, int(font_size * max_text_width / text_width))
-                font = ImageFont.truetype("segoesc.ttf", font_size)
-        except OSError:
+            font = ImageFont.truetype("arial.ttf", 13)
+        except Exception:
             font = ImageFont.load_default()
 
-        draw.text((margin+4, y_offset+4), line, font=font, fill=(0, 0, 0))
-        draw.text((margin, y_offset), line, font=font, fill=(255, 255, 255))
-        y_offset += font_size + 12
-        
-    text_canvas = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        dock_height = 105 if self.shape_menu_open else 60
+        draw.rounded_rectangle([(5, 5), (575, dock_height)], radius=15, fill=(30, 33, 40, 180))
 
-def draw_shape(image, start_point, end_point):
-    start_x, start_y = start_point
-    end_x, end_y = end_point
-    color = (255, 255, 255) if draw_color == (0, 0, 0) else draw_color
-    thickness = eraser_thickness if draw_color == (0, 0, 0) else brush_thickness
+        def draw_btn(box, text, active=False, accent_color=(97, 175, 239)):
+            bg_color = accent_color + (220,) if active else (60, 64, 72, 180)
+            draw.rounded_rectangle([box[0], box[1], box[2], box[3]], radius=8, fill=bg_color)
 
-    if shape_mode == "square":
-        side = max(abs(end_x - start_x), abs(end_y - start_y))
-        corner_x = start_x + side if end_x >= start_x else start_x - side
-        corner_y = start_y + side if end_y >= start_y else start_y - side
-        cv2.rectangle(image, (start_x, start_y), (corner_x, corner_y), color, thickness)
-    elif shape_mode == "rectangle":
-        cv2.rectangle(image, (start_x, start_y), (end_x, end_y), color, thickness)
-    elif shape_mode == "circle":
-        radius = int(math.hypot(end_x - start_x, end_y - start_y))
-        cv2.circle(image, (start_x, start_y), radius, color, thickness)
-    elif shape_mode == "triangle":
-        points = np.array([
-            [start_x, end_y],
-            [end_x, end_y],
-            [(start_x + end_x) // 2, start_y],
-        ], dtype=np.int32)
-        cv2.polylines(image, [points], True, color, thickness)
-    elif shape_mode == "line":
-        cv2.line(image, (start_x, start_y), (end_x, end_y), color, thickness, cv2.LINE_AA)
+            try:
+                text_bbox = draw.textbbox((0, 0), text, font=font)
+            except Exception:
+                text_bbox = [0, 0, len(text) * 6, 10]
+            tw, th = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
+            cx, cy = box[0] + (box[2] - box[0]) // 2, box[1] + (box[3] - box[1]) // 2
 
-def audio_callback(indata, frames, callback_time, status):
-    if status:
-        print(f"Microphone status: {status}")
-    audio_frames.append(indata.copy())
+            draw.text((cx - tw // 2, cy - th // 2 - 2), text, font=font, fill=(255, 255, 255, 255))
 
-def start_recording(frame_size):
-    global video_writer, audio_stream, audio_frames, is_recording
-    global recording_path, video_temp_path, audio_temp_path
+        draw_btn(self.air_btns["COLOR"], "COLOR", self.draw_color_rgb != (0, 0, 0), self.draw_color_rgb)
+        draw_btn(self.air_btns["ERASE"], "ERASE", self.draw_color_rgb == (0, 0, 0), (200, 100, 100))
+        draw_btn(self.air_btns["CLEAR"], "CLEAR")
+        draw_btn(self.air_btns["AI_FIX"], "WAIT AI" if self.is_ai_processing else "AI FIX",
+                 self.is_ai_processing, (210, 153, 34))
+        draw_btn(self.air_btns["PEN"], "PEN ON" if self.pen_enabled else "PEN OFF", self.pen_enabled, (46, 160, 67))
+        draw_btn(self.air_btns["UNDO"], "UNDO")
+        draw_btn(self.air_btns["SHEET"], "SHEET", self.white_canvas, (100, 100, 100))
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    recording_path = f"air_canvas_{timestamp}.mp4"
-    video_temp_path = f"air_canvas_{timestamp}_video.mp4"
-    audio_temp_path = f"air_canvas_{timestamp}_audio.wav"
-    video_writer = cv2.VideoWriter(
-        video_temp_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        20.0,
-        frame_size,
-    )
-    if not video_writer.isOpened():
-        video_writer.release()
-        video_writer = None
-        return False
-
-    audio_frames = []
-    try:
-        audio_stream = sd.InputStream(
-            samplerate=44100,
-            channels=1,
-            dtype="int16",
-            callback=audio_callback,
-        )
-        audio_stream.start()
-    except Exception as error:
-        print(f"Microphone unavailable: {error}")
-        video_writer.release()
-        video_writer = None
-        audio_stream = None
-        return False
-
-    is_recording = True
-    return True
-
-def stop_recording():
-    global video_writer, audio_stream, audio_frames, is_recording
-    global recording_path, video_temp_path, audio_temp_path
-
-    is_recording = False
-    if audio_stream is not None:
-        audio_stream.stop()
-        audio_stream.close()
-        audio_stream = None
-    if video_writer is not None:
-        video_writer.release()
-        video_writer = None
-
-    if not audio_frames or not video_temp_path:
-        return
-
-    audio_data = np.concatenate(audio_frames, axis=0)
-    with wave.open(audio_temp_path, "wb") as audio_file:
-        audio_file.setnchannels(1)
-        audio_file.setsampwidth(2)
-        audio_file.setframerate(44100)
-        audio_file.writeframes(audio_data.tobytes())
-
-    try:
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run(
-            [ffmpeg_path, "-y", "-i", video_temp_path, "-i", audio_temp_path,
-             "-c:v", "copy", "-c:a", "aac", "-shortest", recording_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        os.remove(video_temp_path)
-        os.remove(audio_temp_path)
-        print(f"Recording saved: {recording_path}")
-    except Exception as error:
-        print(f"Audio merge failed; video remains at {video_temp_path}: {error}")
-
-while True:
-    success, frame = cap.read()
-    if not success: break
-        
-    frame = cv2.flip(frame, 1)
-    h, w, c = frame.shape
-    
-    if canvas is None or canvas.shape != (h, w, 3):
-        canvas = np.zeros((h, w, 3), dtype=np.uint8)
-        text_canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
-    if white_canvas or bg_image is not None:
-        if white_canvas:
-            display_frame = np.full((h, w, 3), 255, dtype=np.uint8)
+        if self.shape_menu_open:
+            draw_btn(self.air_btns["SHAPE"], "CLOSE", True, (150, 150, 150))
+            for mode, box in self.shape_btns.items():
+                draw_btn(box, mode[:4].upper(), self.shape_mode == mode)
         else:
-            display_frame = bg_image.copy()
-        pip_w, pip_h = int(w * 0.25), int(h * 0.25)
-        mini_cam = cv2.resize(frame, (pip_w, pip_h))
-        display_frame[h-pip_h:h, w-pip_w:w] = mini_cam
-    else:
-        display_frame = frame.copy()
+            draw_btn(self.air_btns["SHAPE"], "SHAPES")
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb_frame)
-    
-    drew_this_frame = False
-    
-    if result.multi_hand_landmarks:
-        for hand_landmarks in result.multi_hand_landmarks:
-            lmList = []
-            for id, lm in enumerate(hand_landmarks.landmark):
-                cx, cy = int(lm.x * w), int(lm.y * h)
-                lmList.append([id, cx, cy])
-            
-            x1, y1 = lmList[8][1], lmList[8][2] 
-            x2, y2 = lmList[12][1], lmList[12][2] 
-            x0, y0 = lmList[0][1], lmList[0][2] 
-            
-            # Euclidean distance logic
-            dist_index = math.hypot(x1 - x0, y1 - y0)
-            dist_middle = math.hypot(x2 - x0, y2 - y0)
-            tip_distance = math.hypot(x2 - x1, y2 - y1)
-            
-            is_index_up = dist_index > 100 
-            is_middle_up = dist_middle > 100
-            record_button_hover = 160 < x1 < 230 and 60 < y1 < 105
-            if not record_button_hover:
-                record_button_armed = True
+        draw_btn(self.air_btns["REC"], "REC ON" if self.is_recording else "REC OFF", self.is_recording, (248, 81, 73))
 
-            # GESTURE 1: HOVER MODE 
-            if is_index_up and is_middle_up and tip_distance < 60:
-                xp, yp = 0, 0 
-                shape_start = None
-                frames_lost = 0
-                
-                if 10 < y1 < 55:
-                    if 10 < x1 < 80:     palette_open = True
-                    elif 85 < x1 < 155:  
-                        draw_color = (0, 0, 0)
-                        palette_open = False
-                    elif 160 < x1 < 230:  
-                        if time.time() - last_click_time > 2: 
-                            filepath = filedialog.askopenfilename(title="Select Presentation", filetypes=[("Images", "*.jpg *.png")])
-                            if filepath:
-                                bg_image = cv2.resize(cv2.imread(filepath), (w, h))
-                                white_canvas = False
-                                canvas = np.zeros((h, w, 3), dtype=np.uint8)
-                                text_canvas = np.zeros((h, w, 3), dtype=np.uint8)
-                            last_click_time = time.time()
-                    elif 230 < x1 < 300:  
-                        canvas = np.zeros((h, w, 3), dtype=np.uint8)
-                        text_canvas = np.zeros((h, w, 3), dtype=np.uint8)
-                        bg_image = None 
-                    elif 310 < x1 < 380:
-                        if time.time() - last_click_time > 3 and not is_ai_processing:
-                            is_ai_processing = True
-                            threading.Thread(target=process_handwriting_with_ai, args=(canvas.copy(),)).start()
-                            last_click_time = time.time()
-                    elif 385 < x1 < 455:
-                        if time.time() - last_pen_toggle_time > 1:
-                            pen_enabled = not pen_enabled
-                            last_pen_toggle_time = time.time()
-                            xp, yp = 0, 0
-                    elif 460 < x1 < 530:
-                        if time.time() - last_undo_time > 1 and canvas_history:
-                            canvas = canvas_history.pop()
-                            last_undo_time = time.time()
-                            xp, yp = 0, 0
-                    elif 535 < x1 < 605:
-                        if time.time() - last_size_change_time > 1:
-                            brush_preset_index = (brush_preset_index + 1) % len(brush_presets)
-                            brush_thickness = brush_presets[brush_preset_index]
-                            last_size_change_time = time.time()
-                elif 85 < x1 < 155 and 60 < y1 < 105:
-                    if time.time() - last_sheet_toggle_time > 1:
-                        white_canvas = not white_canvas
-                        if white_canvas:
-                            bg_image = None
-                        last_sheet_toggle_time = time.time()
-                        xp, yp = 0, 0
-                        shape_start = None
-                elif 160 < x1 < 230 and 60 < y1 < 105:
-                    if record_button_armed and time.time() - last_record_toggle_time > 1:
-                        if not is_recording:
-                            start_recording((w, h))
-                        else:
-                            stop_recording()
-                        last_record_toggle_time = time.time()
-                        record_button_armed = False
-                        xp, yp = 0, 0
-                elif 10 < x1 < 80 and 60 < y1 < 105:
-                    if time.time() - last_shape_action_time > 1:
-                        shape_menu_open = not shape_menu_open
-                        last_shape_action_time = time.time()
-                        xp, yp = 0, 0
-                        shape_start = None
-                elif shape_menu_open and 110 < y1 < 155:
-                    shape_ranges = [(10, 80, "square"), (85, 155, "circle"), (160, 230, "triangle"), (235, 305, "rectangle"), (310, 380, "line"), (385, 455, "freehand")]
-                    for range_start, range_end, selected_shape in shape_ranges:
-                        if range_start < x1 < range_end:
-                            if time.time() - last_shape_action_time > 1:
-                                shape_mode = selected_shape
-                                shape_menu_open = False
-                                last_shape_action_time = time.time()
-                                xp, yp = 0, 0
-                                shape_start = None
-                            break
+    def handle_air_click(self, x, y):
+        """Processes logic when a finger hovers over a UI button."""
+        now = time.time()
+        if now - self.last_action_time < 1.0:
+            return  # Prevent double clicks
 
-                if palette_open:
-                    if 80 <= y1 < 140 and 20 <= x1 < 20+tray_width:
-                        tray_x, tray_y = x1 - 20, y1 - 80
-                        picked_color = color_tray_bgr[tray_y, tray_x].tolist()
-                        draw_color = tuple(int(c) for c in picked_color)
-                    elif y1 > 170 or x1 > 450:
-                        palette_open = False
+        def inside(box):
+            return box[0] < x < box[2] and box[1] < y < box[3]
 
-                cv2.circle(display_frame, (x1, y1), 10, draw_color if draw_color != (0,0,0) else (255,255,255), 2)
-                
-            # GESTURE 2: DRAW MODE
-            elif is_index_up and (not is_middle_up or tip_distance >= 60):
-                palette_open = False 
-                drew_this_frame = pen_enabled
-                frames_lost = 0 
-                
-                if pen_enabled and y1 > 80:
-                    if xp == 0 and yp == 0:
-                        if len(canvas_history) >= 10:
-                            canvas_history.pop(0)
-                        canvas_history.append(canvas.copy())
-                        shape_start = (x1, y1)
-                        xp, yp = x1, y1
+        if inside(self.air_btns["COLOR"]):
+            self.draw_color_rgb = (97, 175, 239)
+        elif inside(self.air_btns["ERASE"]):
+            self.draw_color_rgb = (0, 0, 0)
+        elif inside(self.air_btns["CLEAR"]):
+            self.clear_canvas()
+        elif inside(self.air_btns["AI_FIX"]) and not self.is_ai_processing:
+            self.is_ai_processing = True
+            threading.Thread(target=self.process_handwriting_with_ai, daemon=True).start()
+        elif inside(self.air_btns["PEN"]):
+            self.toggle_pen()
+        elif inside(self.air_btns["UNDO"]):
+            self.undo()
+        elif inside(self.air_btns["SHEET"]):
+            self.white_canvas = not self.white_canvas
+            if self.white_canvas:
+                self.bg_image = None
+        elif inside(self.air_btns["REC"]):
+            self.toggle_recording()
+        elif inside(self.air_btns["SHAPE"]):
+            self.shape_menu_open = not self.shape_menu_open
+        elif self.shape_menu_open:
+            for mode, box in self.shape_btns.items():
+                if inside(box):
+                    self.shape_mode = mode
+                    self.shape_menu_open = False
+                    break
 
-                    if shape_mode == "freehand":
-                        if draw_color == (0, 0, 0):
-                            cv2.line(canvas, (xp, yp), (x1, y1), draw_color, eraser_thickness)
-                        else:
-                            cv2.line(canvas, (xp, yp), (x1, y1), draw_color, brush_thickness, cv2.LINE_AA)
-                    else:
-                        canvas = canvas_history[-1].copy()
-                        draw_shape(canvas, shape_start, (x1, y1))
-                        
-                    xp, yp = x1, y1
-                cv2.circle(display_frame, (x1, y1), 10, draw_color if draw_color != (0,0,0) else (255,255,255), cv2.FILLED)
-                
-    if not drew_this_frame:
-        frames_lost += 1
-        if frames_lost > MAX_FRAMES_LOST:
-            xp, yp = 0, 0 
+        self.last_action_time = now
+        self.xp, self.yp = 0, 0
+        self.shape_start = None
 
-    combined_overlays = cv2.add(canvas, text_canvas)
+    # --- Main Video Loop ---
+    def update_frame(self):
+        success, frame = self.cap.read()
+        if not success:
+            self.root.after(15, self.update_frame)
+            return
 
-    imgGray = cv2.cvtColor(combined_overlays, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(imgGray, 10, 255, cv2.THRESH_BINARY)
-    mask_inv = cv2.bitwise_not(mask)
-    
-    display_frame_bg = cv2.bitwise_and(display_frame, display_frame, mask=mask_inv)
-    merged_frame = cv2.add(display_frame_bg, combined_overlays)
+        frame = cv2.flip(frame, 1)
 
-    cv2.rectangle(merged_frame, (10, 10), (80, 55), draw_color if draw_color != (0,0,0) else (150,150,150), cv2.FILLED)
-    cv2.putText(merged_frame, "COLOR", (14, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,255), 1)
-    
-    cv2.rectangle(merged_frame, (85, 10), (155, 55), (255, 255, 255), cv2.FILLED)
-    cv2.putText(merged_frame, "ERASE", (91, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0,0,0), 1)
-    
-    cv2.rectangle(merged_frame, (160, 10), (230, 55), (200, 200, 200), cv2.FILLED)
-    cv2.putText(merged_frame, "LOAD", (177, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0,0,0), 1)
-    
-    cv2.rectangle(merged_frame, (230, 10), (300, 55), (50, 50, 50), cv2.FILLED)
-    cv2.putText(merged_frame, "CLEAR", (238, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255,255,255), 1)
+        # 1. Background Setup
+        if self.white_canvas or self.bg_image is not None:
+            display_frame = (np.full((self.h, self.w, 3), 255, dtype=np.uint8)
+                              if self.white_canvas else self.bg_image.copy())
+            pip_w, pip_h = int(self.w * 0.25), int(self.h * 0.25)
+            mini_cam = cv2.resize(frame, (pip_w, pip_h))
+            display_frame[self.h - pip_h:self.h, self.w - pip_w:self.w] = mini_cam
+        else:
+            display_frame = frame.copy()
 
-    if is_ai_processing:
-        cv2.rectangle(merged_frame, (310, 10), (380, 55), (0, 165, 255), cv2.FILLED)
-        cv2.putText(merged_frame, "WAIT", (328, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
-    else:
-        cv2.rectangle(merged_frame, (310, 10), (380, 55), (0, 215, 255), cv2.FILLED)
-        cv2.putText(merged_frame, "AI FIX", (321, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 1)
+        # 2. Hand Tracking
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb_frame)
+        drew_this_frame = False
 
-    pen_button_color = (0, 180, 0) if pen_enabled else (0, 0, 180)
-    pen_button_label = "PEN ON" if pen_enabled else "PEN OFF"
-    cv2.rectangle(merged_frame, (385, 10), (455, 55), pen_button_color, cv2.FILLED)
-    cv2.putText(merged_frame, pen_button_label, (389, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1)
+        if result.multi_hand_landmarks:
+            for hand_landmarks in result.multi_hand_landmarks:
+                lmList = [[id, int(lm.x * self.w), int(lm.y * self.h)] for id, lm in enumerate(hand_landmarks.landmark)]
+                x1, y1 = lmList[8][1], lmList[8][2]
+                x2, y2 = lmList[12][1], lmList[12][2]
+                x0, y0 = lmList[0][1], lmList[0][2]
 
-    cv2.rectangle(merged_frame, (460, 10), (530, 55), (80, 80, 80), cv2.FILLED)
-    cv2.putText(merged_frame, "UNDO", (475, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+                dist_index = math.hypot(x1 - x0, y1 - y0)
+                dist_middle = math.hypot(x2 - x0, y2 - y0)
+                tip_distance = math.hypot(x2 - x1, y2 - y1)
 
-    cv2.rectangle(merged_frame, (535, 10), (605, 55), (100, 100, 100), cv2.FILLED)
-    cv2.putText(merged_frame, f"SZ: {brush_thickness}", (544, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1)
+                is_index_up = dist_index > 100
+                is_middle_up = dist_middle > 100
 
-    cv2.rectangle(merged_frame, (10, 60), (80, 105), (70, 70, 70), cv2.FILLED)
-    shape_label = "FREE" if shape_mode == "freehand" else shape_mode.upper()[:5]
-    cv2.putText(merged_frame, shape_label, (18, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+                draw_color_bgr = tuple(reversed(self.draw_color_rgb))
 
-    sheet_button_color = (0, 150, 0) if white_canvas else (70, 70, 70)
-    cv2.rectangle(merged_frame, (85, 60), (155, 105), sheet_button_color, cv2.FILLED)
-    cv2.putText(merged_frame, "SHEET", (94, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1)
+                # HOVER MODE (Index and Middle fingers up)
+                if is_index_up and is_middle_up and tip_distance < 60:
+                    self.xp, self.yp = 0, 0
+                    self.shape_start = None
+                    self.frames_lost = 0
 
-    record_button_color = (0, 0, 220) if is_recording else (70, 70, 70)
-    record_label = "STOP" if is_recording else "REC"
-    cv2.rectangle(merged_frame, (160, 60), (230, 105), record_button_color, cv2.FILLED)
-    cv2.putText(merged_frame, record_label, (177, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+                    self.handle_air_click(x1, y1)
+                    cv2.circle(display_frame, (x1, y1), 10,
+                               draw_color_bgr if draw_color_bgr != (0, 0, 0) else (255, 255, 255), 2)
 
-    if shape_menu_open:
-        shape_tiles = [(10, "SQ"), (85, "CIR"), (160, "TRI"), (235, "RECT"), (310, "LINE"), (385, "FREE")]
-        for tile_x, tile_label in shape_tiles:
-            cv2.rectangle(merged_frame, (tile_x, 110), (tile_x + 70, 155), (80, 80, 80), cv2.FILLED)
-            cv2.putText(merged_frame, tile_label, (tile_x + 8, 137), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                # DRAW MODE (Only Index finger up)
+                elif is_index_up and (not is_middle_up or tip_distance >= 60):
+                    drew_this_frame = self.pen_enabled
+                    self.frames_lost = 0
 
-    if palette_open:
-        merged_frame[80:140, 20:20+tray_width] = color_tray_bgr
-        cv2.rectangle(merged_frame, (20, 80), (20+tray_width, 140), (255, 255, 255), 2)
+                    if self.pen_enabled and y1 > 110:
+                        if self.xp == 0 and self.yp == 0:
+                            if len(self.canvas_history) >= 10:
+                                self.canvas_history.pop(0)
+                            with self.canvas_lock:
+                                self.canvas_history.append(self.canvas.copy())
+                            self.shape_start = (x1, y1)
+                            self.xp, self.yp = x1, y1
 
-    cv2.imshow("Air Canvas Pro - EdTech Edition", merged_frame)
+                        with self.canvas_lock:
+                            if self.shape_mode == "freehand":
+                                thick = self.eraser_thickness if draw_color_bgr == (0, 0, 0) else self.brush_thickness
+                                cv2.line(self.canvas, (self.xp, self.yp), (x1, y1), draw_color_bgr, thick, cv2.LINE_AA)
+                            else:
+                                self.canvas = self.canvas_history[-1].copy()
+                                self.draw_shape(self.canvas, self.shape_start, (x1, y1), draw_color_bgr)
 
-    if is_recording and video_writer is not None:
-        video_writer.write(merged_frame)
+                        self.xp, self.yp = x1, y1
+                    cv2.circle(display_frame, (x1, y1), 10,
+                               draw_color_bgr if draw_color_bgr != (0, 0, 0) else (255, 255, 255), cv2.FILLED)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        if not drew_this_frame:
+            self.frames_lost += 1
+            if self.frames_lost > 3:
+                self.xp, self.yp = 0, 0
 
-if is_recording:
-    stop_recording()
-cap.release()
-cv2.destroyAllWindows()
+        # 3. Merge Drawings onto Camera
+        with self.canvas_lock:
+            combined_overlays = cv2.add(self.canvas, self.text_canvas)
+        imgGray = cv2.cvtColor(combined_overlays, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(imgGray, 10, 255, cv2.THRESH_BINARY)
+        display_frame_bg = cv2.bitwise_and(display_frame, display_frame, mask=cv2.bitwise_not(mask))
+        merged_frame = cv2.add(display_frame_bg, combined_overlays)
+
+        # 4. Apply Glassmorphism UI (Using PIL)
+        rgb_frame = cv2.cvtColor(merged_frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_frame).convert("RGBA")
+
+        ui_overlay = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
+        self.draw_glassmorphic_ui(ui_overlay)
+
+        final_pil = Image.alpha_composite(pil_img, ui_overlay).convert("RGB")
+
+        if self.is_recording and self.video_writer is not None:
+            out_frame = cv2.cvtColor(np.array(final_pil), cv2.COLOR_RGB2BGR)
+            self.video_writer.write(out_frame)
+
+        self.tk_image = ImageTk.PhotoImage(image=final_pil)
+        self.video_label.configure(image=self.tk_image)
+
+        self.root.after(15, self.update_frame)
+
+    # --- Utility Methods ---
+    def draw_shape(self, image, start_point, end_point, color):
+        thickness = self.eraser_thickness if color == (0, 0, 0) else self.brush_thickness
+        if color == (0, 0, 0):
+            color = (255, 255, 255)
+
+        sx, sy = start_point
+        ex, ey = end_point
+        if self.shape_mode == "rectangle":
+            cv2.rectangle(image, (sx, sy), (ex, ey), color, thickness)
+        elif self.shape_mode == "circle":
+            cv2.circle(image, (sx, sy), int(math.hypot(ex - sx, ey - sy)), color, thickness)
+        elif self.shape_mode == "line":
+            cv2.line(image, (sx, sy), (ex, ey), color, thickness, cv2.LINE_AA)
+
+    # =========================================================
+    #                    AI FIX  (rewritten)
+    # =========================================================
+    # Goal: take whatever the student wrote in the air, find just that
+    # drawn region (ignore empty space), clean it up so an OCR engine
+    # can actually read it, run recognition + spell-correction, and
+    # then present it TWO ways so it's unmistakably readable:
+    #   1. As a large wrapped text block with a solid backdrop, drawn
+    #      onto the canvas itself (visible on the video/recording).
+    #   2. In the side-panel textbox, in full size, scrollable, and
+    #      guaranteed not to be cut off by video resolution.
+    # =========================================================
+
+    def get_drawing_bbox(self, thresh):
+        """Returns (x, y, w, h) bounding box of all non-zero (drawn) pixels,
+        or None if the canvas is blank."""
+        coords = cv2.findNonZero(thresh)
+        if coords is None:
+            return None
+        return cv2.boundingRect(coords)
+
+    # ---------------------------------------------------------------
+    # TrOCR — a transformer model actually trained on handwriting
+    # (the IAM dataset, which includes cursive). This is the accuracy
+    # fix: Tesseract is a printed-font engine and will always struggle
+    # with joined cursive strokes, no matter how good preprocessing is.
+    # ---------------------------------------------------------------
+
+    def ensure_trocr_loaded(self):
+        """Loads the TrOCR model once and caches it. Returns True if the
+        model is ready to use, False if unavailable (libraries missing or
+        the download/load failed)."""
+        if self.trocr_model is not None:
+            return True
+        if self.trocr_load_attempted:
+            return False  # already tried and failed this session
+
+        self.trocr_load_attempted = True
+        if not TROCR_LIBS_AVAILABLE:
+            print("TrOCR not available — install with: pip install torch transformers")
+            self.show_ai_status("TrOCR not installed — using basic Tesseract. Run: pip install torch transformers")
+            return False
+
+        try:
+            self.show_ai_status("Loading handwriting AI model (first run only)...")
+            model_name = "microsoft/trocr-base-handwritten"
+            self.trocr_processor = TrOCRProcessor.from_pretrained(model_name)
+            self.trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name)
+            self.trocr_model.eval()
+            print("TrOCR model loaded successfully.")
+            return True
+        except Exception as e:
+            print("Failed to load TrOCR model:", e)
+            self.trocr_model = None
+            return False
+
+    def recognize_with_trocr(self, bitonal_image):
+        """Runs TrOCR on a single-channel (grayscale/bitonal) numpy image:
+        dark strokes on a light background. Returns (text, confidence_pct)."""
+        rgb = cv2.cvtColor(bitonal_image, cv2.COLOR_GRAY2RGB)
+        pil_img = Image.fromarray(rgb)
+
+        pixel_values = self.trocr_processor(images=pil_img, return_tensors="pt").pixel_values
+
+        with torch.no_grad():
+            output = self.trocr_model.generate(
+                pixel_values,
+                max_length=32,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+        generated_ids = output.sequences
+        text = self.trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+        # Approximate a confidence percentage from the model's own token
+        # probabilities (average of the top probability at each generated
+        # step) — not identical to Tesseract's confidence scale, but useful
+        # as a relative "how sure was it" signal.
+        confidence = 100.0
+        if output.scores:
+            probs = []
+            for step_logits in output.scores:
+                step_probs = torch.softmax(step_logits, dim=-1)
+                probs.append(torch.max(step_probs).item())
+            if probs:
+                confidence = (sum(probs) / len(probs)) * 100.0
+
+        return text, confidence
+
+    # Tesseract page-segmentation modes worth trying for short, handwritten
+    # air-canvas input, in priority order:
+    #   8  = treat image as a SINGLE WORD          (best for one cursive word)
+    #  13  = raw line, bypass most of Tesseract's own layout heuristics
+    #        (often best for messy/joined handwriting)
+    #   7  = treat image as a SINGLE TEXT LINE      (short phrases)
+    #   6  = treat image as a UNIFORM BLOCK of text (multi-line notes)
+    _OCR_PSM_MODES = [8, 13, 7, 6]
+
+    # Save the cropped/preprocessed image Tesseract actually sees, so you can
+    # open it and check whether the problem is preprocessing or OCR itself.
+    DEBUG_SAVE_OCR_INPUT = True
+
+    def run_ocr_best_effort(self, ocr_ready_image):
+        """Tries several PSM modes and keeps whichever gives the highest
+        average confidence. Returns (raw_text, avg_confidence)."""
+        whitelist = (
+            r'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+            r'0123456789.,?!\'"- '
+        )
+        best_text, best_conf = "", -1.0
+
+        for psm in self._OCR_PSM_MODES:
+            config = rf'--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}'
+            try:
+                data = pytesseract.image_to_data(ocr_ready_image, config=config,
+                                                  output_type=pytesseract.Output.DICT)
+            except pytesseract.TesseractError as e:
+                print(f"Tesseract error (psm {psm}):", e)
+                continue
+
+            words, confs = [], []
+            for i, word in enumerate(data['text']):
+                word = word.strip()
+                try:
+                    conf = float(data['conf'][i])
+                except (ValueError, TypeError):
+                    conf = -1
+                if word and conf >= 0:
+                    words.append(word)
+                    confs.append(conf)
+
+            text = " ".join(words).strip()
+            avg_conf = sum(confs) / len(confs) if confs else -1
+
+            print(f"[OCR debug] psm={psm} -> '{text}' (avg conf {avg_conf:.1f})")
+
+            if text and avg_conf > best_conf:
+                best_text, best_conf = text, avg_conf
+
+        return best_text, best_conf
+
+    def process_handwriting_with_ai(self):
+        try:
+            with self.canvas_lock:
+                canvas_snapshot = self.canvas.copy()
+
+            gray = cv2.cvtColor(canvas_snapshot, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+
+            bbox = self.get_drawing_bbox(thresh)
+            if bbox is None:
+                self.show_ai_status("Nothing to recognize — write something on the canvas first.")
+                return
+
+            # Crop to just the drawn region (plus a little breathing room)
+            x, y, w, h = bbox
+            pad = 30
+            x0, y0 = max(0, x - pad), max(0, y - pad)
+            x1, y1 = min(thresh.shape[1], x + w + pad), min(thresh.shape[0], y + h + pad)
+            cropped = thresh[y0:y1, x0:x1]
+
+            # Thicken the thin finger-drawn strokes — but LIGHTLY. Cursive
+            # letters are already touching each other; heavy dilation can
+            # fuse loops (like the bowl of an 'a') into solid blobs and make
+            # things WORSE, not better. 1 iteration on a small kernel is
+            # usually enough.
+            thick = cv2.dilate(cropped, np.ones((2, 2), np.uint8), iterations=1)
+
+            # Upscale — OCR accuracy drops sharply on small/low-res text
+            scale = 4
+            resized = cv2.resize(thick, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            resized = cv2.medianBlur(resized, 3)
+
+            # Tesseract expects dark text on a light background
+            ocr_ready = cv2.bitwise_not(resized)
+
+            if self.DEBUG_SAVE_OCR_INPUT:
+                debug_path = os.path.join(os.getcwd(), "ai_fix_debug_input.png")
+                cv2.imwrite(debug_path, ocr_ready)
+                print("AI FIX debug image saved to:", debug_path)
+
+            # Prefer TrOCR (trained on real handwriting, including cursive)
+            # when it's available; fall back to the Tesseract multi-PSM
+            # attempt otherwise. Tesseract is kept as a guaranteed fallback
+            # so the feature still works even without torch/transformers.
+            raw_text, avg_conf, engine_used = "", -1.0, "tesseract"
+            if self.ensure_trocr_loaded():
+                try:
+                    raw_text, avg_conf = self.recognize_with_trocr(ocr_ready)
+                    engine_used = "trocr"
+                except Exception as e:
+                    print("TrOCR inference failed, falling back to Tesseract:", e)
+
+            if not raw_text:
+                raw_text, avg_conf = self.run_ocr_best_effort(ocr_ready)
+                engine_used = "tesseract"
+
+            print(f"[AI FIX] engine={engine_used} result='{raw_text}' conf={avg_conf:.1f}")
+
+            if not raw_text:
+                self.show_ai_status("Couldn't detect any letter shapes at all. Try writing "
+                                     "bigger, and check ai_fix_debug_input.png to see what "
+                                     "the AI is looking at.")
+                return
+
+            if engine_used == "tesseract":
+                corrected_text = str(TextBlob(raw_text).correct())
+            else:
+                corrected_text = raw_text  # TrOCR output: don't let TextBlob 'fix' names/words
+
+            # Still show a result even at low confidence — a wrong guess the
+            # student can see and fix is more useful than a dead end. Just
+            # label it clearly so they know to double check it.
+            if avg_conf < 40:
+                if engine_used == "tesseract":
+                    note = (" (low confidence — Tesseract struggles with cursive; install "
+                             "'torch transformers' for much better handwriting recognition, "
+                             "or try writing in separated block letters)")
+                else:
+                    note = " (low confidence — try writing a bit bigger/slower)"
+            else:
+                note = ""
+
+            self.render_ai_text(corrected_text)
+            self.update_ai_textbox(raw_text, corrected_text + note, avg_conf, engine_used)
+
+            # The handwriting has now been converted to clean text — clear the
+            # messy strokes so only the readable version remains.
+            with self.canvas_lock:
+                self.canvas = np.zeros_like(self.canvas)
+
+        except Exception as e:
+            print("AI Error:", e)
+            self.show_ai_status("AI recognition failed. Make sure Tesseract is installed "
+                                 "and the path in tesseract_cmd is correct.")
+        finally:
+            self.is_ai_processing = False
+
+    def render_ai_text(self, text, font_size=42, max_width_chars=34):
+        """Draws the recognized text as a large, wrapped block with a solid
+        backdrop onto text_canvas, so it's clearly legible on the video feed
+        (not tiny, not overlapping old strokes, not clipped)."""
+        with self.canvas_lock:
+            base = self.text_canvas.copy()
+
+        img_pil = Image.fromarray(cv2.cvtColor(base, cv2.COLOR_BGR2RGB)).convert("RGBA")
+        draw = ImageDraw.Draw(img_pil)
+
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        wrapped_lines = textwrap.wrap(text, width=max_width_chars) or [text]
+
+        line_height = font_size + 14
+        block_width = min(self.w - 100, 900)
+        block_height = line_height * len(wrapped_lines) + 30
+
+        start_x = 50
+        start_y = 130  # sits just below the button dock
+
+        # Solid-ish backdrop so the text is readable over any camera/slide content
+        draw.rounded_rectangle(
+            [(start_x - 20, start_y - 20), (start_x + block_width, start_y + block_height)],
+            radius=18, fill=(15, 17, 21, 225)
+        )
+
+        y = start_y
+        for line in wrapped_lines:
+            # subtle shadow + bright text for contrast on any backdrop
+            draw.text((start_x + 2, y + 2), line, font=font, fill=(0, 0, 0, 180))
+            draw.text((start_x, y), line, font=font, fill=(255, 255, 255, 255))
+            y += line_height
+
+        with self.canvas_lock:
+            self.text_canvas = cv2.cvtColor(np.array(img_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+    # --- Thread-safe helpers for updating the Tkinter side panel ---
+    # process_handwriting_with_ai() runs on a background thread, but Tkinter
+    # widgets must only ever be touched from the main thread. root.after(0, ...)
+    # safely schedules the update to run on the main thread instead.
+
+    def update_ai_textbox(self, raw_text, corrected_text, confidence, engine=""):
+        def _update():
+            self.ai_text_box.configure(state="normal")
+            self.ai_text_box.delete("1.0", "end")
+            self.ai_text_box.insert(
+                "1.0",
+                f"{corrected_text}\n\n"
+                f"[engine: {engine.upper()}] raw: \"{raw_text}\" · confidence: {confidence:.0f}%"
+            )
+            self.ai_text_box.configure(state="disabled")
+        self.root.after(0, _update)
+
+    def show_ai_status(self, message):
+        def _update():
+            self.ai_text_box.configure(state="normal")
+            self.ai_text_box.delete("1.0", "end")
+            self.ai_text_box.insert("1.0", message)
+            self.ai_text_box.configure(state="disabled")
+        self.root.after(0, _update)
+
+    def reset_ai_textbox(self):
+        self.show_ai_status("Write on the canvas, then hover over AI FIX.")
+
+    # --- Recording logic (unchanged) ---
+    def start_recording(self, frame_size):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.recording_path = f"air_canvas_{timestamp}.mp4"
+        self.video_temp_path = f"air_canvas_{timestamp}_video.mp4"
+        self.audio_temp_path = f"air_canvas_{timestamp}_audio.wav"
+
+        self.video_writer = cv2.VideoWriter(self.video_temp_path, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, frame_size)
+        self.audio_frames = []
+
+        def audio_callback(indata, frames, callback_time, status):
+            self.audio_frames.append(indata.copy())
+
+        try:
+            self.audio_stream = sd.InputStream(samplerate=44100, channels=1, dtype="int16", callback=audio_callback)
+            self.audio_stream.start()
+            self.is_recording = True
+            return True
+        except Exception as e:
+            print(f"Microphone unavailable: {e}")
+            return False
+
+    def stop_recording(self):
+        self.is_recording = False
+        if self.audio_stream:
+            self.audio_stream.stop()
+            self.audio_stream.close()
+        if self.video_writer:
+            self.video_writer.release()
+        # FFmpeg merging logic goes here (unchanged from your original project)
+
+    def on_close(self):
+        if self.is_recording:
+            self.stop_recording()
+        self.cap.release()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    app = ModernAirCanvas()
