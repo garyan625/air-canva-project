@@ -32,3 +32,17 @@ air-canva-project/
 ├── project.py              # Main execution script
 ├── modern_air_canva.py    # Project dependencies
 ├── README.md            # Project documentation
+
+---
+requirements/
+opencv-python
+mediapipe
+numpy
+customtkinter
+pillow
+pytesseract
+textblob
+sounddevice
+imageio-ffmpeg
+torch
+transformers
