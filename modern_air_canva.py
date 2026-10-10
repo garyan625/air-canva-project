@@ -49,6 +49,8 @@ class ModernAirCanvas:
         self.root = ctk.CTk()
         self.root.title("Air Canvas Pro - EdTech Edition")
         self.root.geometry("1100x650")
+        self.root.minsize(900, 600)
+        self.root.state("zoomed")
 
         # --- Layout Frames ---
         self.main_container = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -88,6 +90,16 @@ class ModernAirCanvas:
 
         # Modern Palette Colors (RGB for PIL)
         self.draw_color_rgb = (97, 175, 239)  # Soft Blue
+        self.color_menu_open = False
+        self.color_button_armed = True
+        self.color_options = [
+            ("BLUE", (97, 175, 239)),
+            ("GREEN", (46, 160, 67)),
+            ("RED", (248, 81, 73)),
+            ("YELLOW", (210, 153, 34)),
+            ("PURPLE", (180, 130, 220)),
+            ("WHITE", (245, 245, 245)),
+        ]
         self.brush_thickness = 5
         self.eraser_thickness = 50
         self.shape_mode = "freehand"
@@ -97,6 +109,7 @@ class ModernAirCanvas:
 
         # Timers to prevent double-clicks
         self.last_action_time = 0
+        self.sheet_button_armed = True
         self.frames_lost = 0
 
         # Recording State
@@ -181,7 +194,13 @@ class ModernAirCanvas:
             "freehand": (95, 60, 165, 95),
             "line": (175, 60, 245, 95),
             "rectangle": (255, 60, 325, 95),
-            "circle": (335, 60, 405, 95)
+            "circle": (335, 60, 405, 95),
+            "square": (415, 60, 485, 95),
+            "triangle": (495, 60, 565, 95)
+        }
+        self.color_btns = {
+            name: (95 + index * 80, 60, 165 + index * 80, 95)
+            for index, (name, _) in enumerate(self.color_options)
         }
 
     # --- Interaction Logic Methods ---
@@ -211,9 +230,14 @@ class ModernAirCanvas:
     def load_bg(self):
         filepath = filedialog.askopenfilename(title="Select Presentation", filetypes=[("Images", "*.jpg *.png")])
         if filepath:
-            self.bg_image = cv2.resize(cv2.imread(filepath), (self.w, self.h))
-            self.white_canvas = False
+            image = cv2.imread(filepath)
+            if image is None:
+                self.show_ai_status("Could not open the selected image.")
+                return
+
             self.clear_canvas()
+            self.bg_image = cv2.resize(image, (self.w, self.h))
+            self.white_canvas = False
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -234,7 +258,7 @@ class ModernAirCanvas:
         except Exception:
             font = ImageFont.load_default()
 
-        dock_height = 105 if self.shape_menu_open else 60
+        dock_height = 105 if self.shape_menu_open or self.color_menu_open else 60
         draw.rounded_rectangle([(5, 5), (575, dock_height)], radius=15, fill=(30, 33, 40, 180))
 
         def draw_btn(box, text, active=False, accent_color=(97, 175, 239)):
@@ -250,7 +274,7 @@ class ModernAirCanvas:
 
             draw.text((cx - tw // 2, cy - th // 2 - 2), text, font=font, fill=(255, 255, 255, 255))
 
-        draw_btn(self.air_btns["COLOR"], "COLOR", self.draw_color_rgb != (0, 0, 0), self.draw_color_rgb)
+        draw_btn(self.air_btns["COLOR"], "COLOR", True, self.draw_color_rgb)
         draw_btn(self.air_btns["ERASE"], "ERASE", self.draw_color_rgb == (0, 0, 0), (200, 100, 100))
         draw_btn(self.air_btns["CLEAR"], "CLEAR")
         draw_btn(self.air_btns["AI_FIX"], "WAIT AI" if self.is_ai_processing else "AI FIX",
@@ -263,6 +287,22 @@ class ModernAirCanvas:
             draw_btn(self.air_btns["SHAPE"], "CLOSE", True, (150, 150, 150))
             for mode, box in self.shape_btns.items():
                 draw_btn(box, mode[:4].upper(), self.shape_mode == mode)
+        elif self.color_menu_open:
+            draw_btn(self.air_btns["SHAPE"], "SHAPES")
+            for name, color in self.color_options:
+                box = self.color_btns[name]
+                draw.rounded_rectangle([box[0], box[1], box[2], box[3]], radius=8,
+                                       fill=color + (230,))
+                if color == self.draw_color_rgb:
+                    draw.rounded_rectangle([box[0], box[1], box[2], box[3]], radius=8,
+                                           outline=(255, 255, 255, 255), width=3)
+                text_color = (20, 20, 20, 255) if sum(color) > 390 else (255, 255, 255, 255)
+                label_box = draw.textbbox((0, 0), name, font=font)
+                label_width = label_box[2] - label_box[0]
+                label_height = label_box[3] - label_box[1]
+                label_x = box[0] + (box[2] - box[0] - label_width) // 2
+                label_y = box[1] + (box[3] - box[1] - label_height) // 2 - 2
+                draw.text((label_x, label_y), name, font=font, fill=text_color)
         else:
             draw_btn(self.air_btns["SHAPE"], "SHAPES")
 
@@ -271,16 +311,32 @@ class ModernAirCanvas:
     def handle_air_click(self, x, y):
         """Processes logic when a finger hovers over a UI button."""
         now = time.time()
-        if now - self.last_action_time < 1.0:
-            return  # Prevent double clicks
-
         def inside(box):
             return box[0] < x < box[2] and box[1] < y < box[3]
 
+        on_color_button = inside(self.air_btns["COLOR"])
+        if not on_color_button:
+            self.color_button_armed = True
+        elif not self.color_button_armed:
+            return
+
+        on_sheet_button = inside(self.air_btns["SHEET"])
+        if not on_sheet_button:
+            self.sheet_button_armed = True
+        elif not self.sheet_button_armed:
+            return
+
+        if now - self.last_action_time < 1.0:
+            return  # Prevent double clicks
+
         if inside(self.air_btns["COLOR"]):
-            self.draw_color_rgb = (97, 175, 239)
+            self.color_menu_open = not self.color_menu_open
+            self.color_button_armed = False
+            if self.color_menu_open:
+                self.shape_menu_open = False
         elif inside(self.air_btns["ERASE"]):
             self.draw_color_rgb = (0, 0, 0)
+            self.color_menu_open = False
         elif inside(self.air_btns["CLEAR"]):
             self.clear_canvas()
         elif inside(self.air_btns["AI_FIX"]) and not self.is_ai_processing:
@@ -294,10 +350,19 @@ class ModernAirCanvas:
             self.white_canvas = not self.white_canvas
             if self.white_canvas:
                 self.bg_image = None
+            self.sheet_button_armed = False
         elif inside(self.air_btns["REC"]):
             self.toggle_recording()
         elif inside(self.air_btns["SHAPE"]):
             self.shape_menu_open = not self.shape_menu_open
+            if self.shape_menu_open:
+                self.color_menu_open = False
+        elif self.color_menu_open:
+            for name, box in self.color_btns.items():
+                if inside(box):
+                    self.draw_color_rgb = dict(self.color_options)[name]
+                    self.color_menu_open = False
+                    break
         elif self.shape_menu_open:
             for mode, box in self.shape_btns.items():
                 if inside(box):
@@ -324,7 +389,10 @@ class ModernAirCanvas:
                               if self.white_canvas else self.bg_image.copy())
             pip_w, pip_h = int(self.w * 0.25), int(self.h * 0.25)
             mini_cam = cv2.resize(frame, (pip_w, pip_h))
-            display_frame[self.h - pip_h:self.h, self.w - pip_w:self.w] = mini_cam
+            pip_y = self.h - pip_h - 12
+            pip_x = 12
+            display_frame[pip_y:pip_y + pip_h, pip_x:pip_x + pip_w] = mini_cam
+            cv2.rectangle(display_frame, (pip_x, pip_y), (pip_x + pip_w, pip_y + pip_h), (255, 255, 255), 2)
         else:
             display_frame = frame.copy()
 
@@ -411,7 +479,16 @@ class ModernAirCanvas:
             out_frame = cv2.cvtColor(np.array(final_pil), cv2.COLOR_RGB2BGR)
             self.video_writer.write(out_frame)
 
-        self.tk_image = ImageTk.PhotoImage(image=final_pil)
+        label_width = self.video_label.winfo_width()
+        label_height = self.video_label.winfo_height()
+        if label_width > 100 and label_height > 100:
+            scale = min(label_width / self.w, label_height / self.h)
+            display_size = (int(self.w * scale), int(self.h * scale))
+            display_pil = final_pil.resize(display_size, Image.Resampling.LANCZOS)
+        else:
+            display_pil = final_pil
+
+        self.tk_image = ImageTk.PhotoImage(image=display_pil)
         self.video_label.configure(image=self.tk_image)
 
         self.root.after(15, self.update_frame)
@@ -424,7 +501,19 @@ class ModernAirCanvas:
 
         sx, sy = start_point
         ex, ey = end_point
-        if self.shape_mode == "rectangle":
+        if self.shape_mode == "square":
+            side = max(abs(ex - sx), abs(ey - sy))
+            corner_x = sx + side if ex >= sx else sx - side
+            corner_y = sy + side if ey >= sy else sy - side
+            cv2.rectangle(image, (sx, sy), (corner_x, corner_y), color, thickness)
+        elif self.shape_mode == "triangle":
+            points = np.array([
+                [sx, ey],
+                [ex, ey],
+                [(sx + ex) // 2, sy],
+            ], dtype=np.int32)
+            cv2.polylines(image, [points], True, color, thickness, cv2.LINE_AA)
+        elif self.shape_mode == "rectangle":
             cv2.rectangle(image, (sx, sy), (ex, ey), color, thickness)
         elif self.shape_mode == "circle":
             cv2.circle(image, (sx, sy), int(math.hypot(ex - sx, ey - sy)), color, thickness)
@@ -746,6 +835,12 @@ class ModernAirCanvas:
         self.audio_temp_path = f"air_canvas_{timestamp}_audio.wav"
 
         self.video_writer = cv2.VideoWriter(self.video_temp_path, cv2.VideoWriter_fourcc(*"mp4v"), 20.0, frame_size)
+        if not self.video_writer.isOpened():
+            self.video_writer.release()
+            self.video_writer = None
+            print("Could not start video recording.")
+            return False
+
         self.audio_frames = []
 
         def audio_callback(indata, frames, callback_time, status):
@@ -758,16 +853,54 @@ class ModernAirCanvas:
             return True
         except Exception as e:
             print(f"Microphone unavailable: {e}")
+            if self.audio_stream is not None:
+                self.audio_stream.close()
+                self.audio_stream = None
+            self.video_writer.release()
+            self.video_writer = None
             return False
 
     def stop_recording(self):
         self.is_recording = False
-        if self.audio_stream:
+        if self.audio_stream is not None:
             self.audio_stream.stop()
             self.audio_stream.close()
-        if self.video_writer:
+            self.audio_stream = None
+        if self.video_writer is not None:
             self.video_writer.release()
-        # FFmpeg merging logic goes here (unchanged from your original project)
+            self.video_writer = None
+
+        if not self.audio_frames:
+            print("No microphone audio was captured; check the selected input device and microphone permissions.")
+            return
+
+        audio_data = np.concatenate(self.audio_frames, axis=0)
+        with wave.open(self.audio_temp_path, "wb") as audio_file:
+            audio_file.setnchannels(1)
+            audio_file.setsampwidth(2)
+            audio_file.setframerate(44100)
+            audio_file.writeframes(audio_data.tobytes())
+
+        try:
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.run(
+                [
+                    ffmpeg_path, "-y", "-i", self.video_temp_path, "-i", self.audio_temp_path,
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                    "-b:a", "128k", "-shortest", "-movflags", "+faststart", self.recording_path,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.remove(self.video_temp_path)
+            os.remove(self.audio_temp_path)
+            print(f"Recording saved with microphone audio: {self.recording_path}")
+        except (OSError, subprocess.CalledProcessError) as error:
+            details = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+            print(f"Could not merge recording audio: {details}")
+            print(f"Video and audio remain available at {self.video_temp_path} and {self.audio_temp_path}.")
 
     def on_close(self):
         if self.is_recording:
