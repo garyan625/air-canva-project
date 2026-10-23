@@ -32,6 +32,9 @@ import gc
 import re
 import sys
 import traceback
+import webbrowser
+import importlib.util
+from urllib.parse import quote_plus
 
 # Which model to use. Qwen2.5-VL-3B is the default. To try the newer, slightly
 # stronger Qwen3-VL-4B (needs a recent transformers: pip install -U transformers)
@@ -174,6 +177,118 @@ def render_bitmap_page(mask, brush_px, thickness_scale=1.0):
         big = cv2.dilate(big, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     big = cv2.GaussianBlur(big, (3, 3), 0)
     return _place_on_page(big)
+
+
+# ---------------------------------------------------------------------------
+# Line segmentation. Multi-line writing is split into text lines, and every
+# line is read on its own: that is the same single-line input the model
+# already reads well, and it avoids shrinking a whole page into one small image.
+# Lines should be separated by a clear gap and written roughly level. Lift the
+# finger (two-finger hover) between lines so a stroke never joins two lines.
+# ---------------------------------------------------------------------------
+MAX_LINES = 8
+
+
+def find_line_bands(mask):
+    """mask: uint8 image, non-zero where there is ink. Returns a list of
+    (y0, y1) row ranges (inclusive), top to bottom, one per text line."""
+    occupied = (mask > 0)
+    rows = np.flatnonzero(occupied.any(axis=1))
+    if len(rows) == 0:
+        return []
+    total_h = int(rows[-1] - rows[0] + 1)
+    gap_tol = max(2, int(0.03 * total_h))
+
+    bands = []                       # runs of occupied rows (gaps up to gap_tol are bridged)
+    start = prev = int(rows[0])
+    for r in rows[1:]:
+        r = int(r)
+        if r - prev - 1 > gap_tol:
+            bands.append([start, prev])
+            start = r
+        prev = r
+    bands.append([start, prev])
+
+    # Tiny fragments (the dot of an 'i', the bar of a 't') belong to the nearest line.
+    while len(bands) > 1:
+        heights = [b[1] - b[0] + 1 for b in bands]
+        href = max(heights)
+        merged = False
+        for i, h in enumerate(heights):
+            if h >= 0.3 * href:
+                continue
+            gaps = []
+            if i > 0:
+                gaps.append((bands[i][0] - bands[i - 1][1] - 1, i - 1))
+            if i < len(bands) - 1:
+                gaps.append((bands[i + 1][0] - bands[i][1] - 1, i + 1))
+            gap, j = min(gaps)
+            if gap < 0.35 * href:
+                lo, hi = min(i, j), max(i, j)
+                bands[lo] = [bands[lo][0], bands[hi][1]]
+                del bands[hi]
+                merged = True
+                break
+        if not merged:
+            break
+
+    # Stray marks (an accidental blob far from the writing) are not text lines.
+    ink = [int(occupied[b[0]:b[1] + 1].sum()) for b in bands]
+    biggest = max(ink)
+    bands = [tuple(b) for b, k in zip(bands, ink) if k >= 0.025 * biggest]
+    return bands
+
+
+def assign_strokes_to_bands(strokes, bands):
+    """Gives every stroke to the text line it lies in. Returns (strokes_per_band,
+    clean). clean is False when a stroke runs across two lines (the finger was
+    not lifted between lines), in which case the caller should use the bitmap."""
+    y0s = np.array([b[0] for b in bands], dtype=np.float32)
+    y1s = np.array([b[1] for b in bands], dtype=np.float32)
+    out = [[] for _ in bands]
+    clean = True
+    for stroke in strokes:
+        pts = np.asarray(stroke, dtype=np.float32).reshape(-1, 2)
+        if len(pts) == 0:
+            continue
+        ys = pts[:, 1][:, None]
+        d = np.maximum(np.maximum(y0s[None, :] - ys, ys - y1s[None, :]), 0)   # 0 = inside the band
+        which = np.argmin(d, axis=1)
+        near = d[np.arange(len(pts)), which] <= 3
+        if near.mean() < 0.5:
+            continue                                  # belongs to a dropped stray mark
+        counts = np.bincount(which[near], minlength=len(bands))
+        best = int(counts.argmax())
+        if len(pts) >= 8 and (near.sum() - counts[best]) > 0.15 * len(pts):
+            clean = False
+        out[best].append(stroke)
+    return out, clean
+
+
+def build_line_pages(strokes, mask, use_strokes, brush_px):
+    """Splits the writing into lines and renders every line in the different
+    pen/smoothing variants. Returns [{"band": (y0, y1), "pages": [images...]}]."""
+    bands = find_line_bands(mask)[:MAX_LINES]
+    if not bands:
+        return []
+    per_band = None
+    if use_strokes:
+        per_band, clean = assign_strokes_to_bands(strokes, bands)
+        if not clean or any(len(s) == 0 for s in per_band):
+            per_band = None                           # strokes do not match the lines: use the bitmap
+    lines = []
+    for i, (y0, y1) in enumerate(bands):
+        pages = []
+        for thickness, smooth_iters in VLM_RENDER_VARIANTS:
+            if per_band is not None:
+                page = render_strokes_page(per_band[i], thickness, smooth_iters)
+            else:
+                page = render_bitmap_page(mask[y0:y1 + 1], brush_px, thickness)
+            if page is not None:
+                pages.append(page)
+        if pages:
+            lines.append({"band": (int(y0), int(y1)), "pages": pages})
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +539,7 @@ class QwenHandwritingReader:
         inputs = inputs.to(self.model.device)
 
         with torch.inference_mode():
-            out = self.model.generate(**inputs, max_new_tokens=64, do_sample=False,
+            out = self.model.generate(**inputs, max_new_tokens=96, do_sample=False,
                                       output_scores=True, return_dict_in_generate=True)
 
         new_tokens = out.sequences[0, inputs.input_ids.shape[1]:]
@@ -448,7 +563,7 @@ class QwenHandwritingReader:
             return self._parse_spelled(raw), conf
         if raw.upper().startswith("UNREADABLE"):
             return "", 0.0
-        return raw, conf
+        return re.sub(r"\s*\n+\s*", " ", raw).strip(), conf      # one line in, one line out
 
     @staticmethod
     def _key(text):
@@ -458,19 +573,26 @@ class QwenHandwritingReader:
     # by letter is the main one; plain transcription is a cross-check.
     READ_PLAN = (("spell", 0), ("spell", 1), ("word", 0), ("spell", 2), ("word", 1))
 
-    def read(self, pages):
-        """Takes up to 5 readings and returns the consensus (or None if the
-        writing was unreadable). Stops after 3 if they all agree exactly."""
+    def read(self, pages, fast=False):
+        """Takes several readings of one line of writing and returns the consensus
+        (or None if it was unreadable). Normal mode takes up to 5 readings and stops
+        after 3 if they all agree. fast=True (used for every line of multi-line text,
+        to keep the total time down) takes up to 4 and stops as soon as two agree."""
         cands = []
         plan = self.READ_PLAN[:1] + (self.READ_PLAN[2:3] if self.on_cpu else self.READ_PLAN[1:])
+        if fast and not self.on_cpu:
+            plan = plan[:4]
         for mode, idx in plan:
             if idx >= len(pages):
                 continue
             text, conf = self._read_once(pages[idx], mode)
             print(f"[Qwen] {mode:5s} / rendering {idx + 1}: '{text}' (token conf {conf:.0f}%)")
             cands.append({"text": text, "tok": conf, "mode": mode})
-            if len(cands) == 3 and all(c["text"] for c in cands) \
-                    and len({self._key(c["text"]) for c in cands}) == 1:
+            keys = [self._key(c["text"]) for c in cands if c["text"]]
+            if fast:
+                if keys and max(keys.count(k) for k in set(keys)) >= 2:
+                    break
+            elif len(cands) == 3 and len(keys) == 3 and len(set(keys)) == 1:
                 break
         return self.consensus(cands)
 
@@ -541,6 +663,45 @@ def run_diagnostics(image_path="ai_fix_debug_input.png"):
         print(f"No '{image_path}' found - use AI FIX once in the app to create it, then re-run.")
         return
     print("Recognition result:", reader.read([img]))
+
+
+# ---------------------------------------------------------------------------
+# Reference lookup (YouTube / Google) for use while teaching. The result opens
+# in a small browser window of its own (needs:  pip install pywebview). Without
+# pywebview it opens in the computer's normal browser instead.
+# ---------------------------------------------------------------------------
+REFERENCE_SITES = {
+    "Google": "https://www.google.com/search?q=",
+    "Images": "https://www.google.com/search?tbm=isch&q=",
+    "YouTube": "https://www.youtube.com/results?search_query=",
+}
+
+_BROWSER_WINDOW_CODE = (
+    "import sys, webview; "
+    "webview.create_window(sys.argv[2], sys.argv[1], width=1150, height=740); "
+    "webview.start()"
+)
+
+
+def build_reference_url(query, site="Google"):
+    """A pasted web link is used as it is; anything else is searched on the chosen site."""
+    query = query.strip()
+    if re.match(r"https?://", query, re.I):
+        return query
+    return REFERENCE_SITES.get(site, REFERENCE_SITES["Google"]) + quote_plus(query)
+
+
+def open_reference(url, title="Reference"):
+    """Opens url in an embedded browser window. Returns (kind, process_or_None)
+    where kind is 'window' or 'browser'."""
+    if importlib.util.find_spec("webview") is not None:
+        try:
+            proc = subprocess.Popen([sys.executable, "-c", _BROWSER_WINDOW_CODE, url, title])
+            return "window", proc
+        except Exception as e:
+            print("[Reference] could not start the browser window:", e)
+    webbrowser.open(url)
+    return "browser", None
 
 
 class ModernAirCanvas:
@@ -635,6 +796,10 @@ class ModernAirCanvas:
         self.audio_frames = []
         self.is_ai_processing = False
         self.shape_menu_open = False
+        self.last_ai_text = ""          # last AI FIX result, offered in the Reference search box
+        self.ref_site = "YouTube"
+        self.ref_window = None
+        self.ref_procs = []
 
         # Qwen2.5-VL reader. Loaded in a background thread shortly after startup
         # (or on first AI FIX). show_ai_status is thread-safe.
@@ -657,6 +822,7 @@ class ModernAirCanvas:
             self.root.after(1500, lambda: threading.Thread(
                 target=self._preload_reader, daemon=True).start())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Control-r>", lambda e: self.open_reference_dialog())
         self.root.mainloop()
 
     def build_side_panel(self):
@@ -678,11 +844,13 @@ class ModernAirCanvas:
 
         ctk.CTkButton(self.side_panel, text="Load Presentation", fg_color="#444C56",
                       command=self.load_bg).pack(pady=(20, 10), padx=20, fill="x")
+        ctk.CTkButton(self.side_panel, text="Reference: YouTube / Google (Ctrl+R)", fg_color="#1F6FEB",
+                      hover_color="#1A58BA", command=self.open_reference_dialog).pack(pady=(0, 10), padx=20, fill="x")
 
         # AI recognized-text panel
         ctk.CTkLabel(self.side_panel, text="AI Recognized Text",
                      font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(10, 5))
-        self.ai_text_box = ctk.CTkTextbox(self.side_panel, height=160, wrap="word",
+        self.ai_text_box = ctk.CTkTextbox(self.side_panel, height=130, wrap="word",
                                            font=ctk.CTkFont(size=15))
         self.ai_text_box.pack(pady=(0, 10), padx=20, fill="x")
         self.ai_text_box.insert("1.0", "Write on the canvas, then hover over AI FIX.")
@@ -761,6 +929,54 @@ class ModernAirCanvas:
             self.clear_canvas()
             self.bg_image = cv2.resize(image, (self.w, self.h))
             self.white_canvas = False
+
+    # --- Reference lookup window (YouTube / Google) ---
+    def open_reference_dialog(self):
+        """Small search window. The box is pre-filled with the last AI FIX text,
+        so write a word in the air -> AI FIX -> Ctrl+R -> pick YouTube / Google."""
+        if self.ref_window is not None:
+            try:
+                if self.ref_window.winfo_exists():
+                    self.ref_window.deiconify()
+                    self.ref_window.lift()
+                    self.ref_window.focus_force()
+                    return
+            except Exception:
+                pass
+        win = ctk.CTkToplevel(self.root)
+        self.ref_window = win
+        win.title("Reference lookup")
+        win.geometry("460x230")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        ctk.CTkLabel(win, text="Search for something to show the class",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(16, 6))
+        entry = ctk.CTkEntry(win, width=400, placeholder_text="type a topic, or paste a YouTube / web link")
+        entry.pack(pady=6)
+        if self.last_ai_text:
+            entry.insert(0, self.last_ai_text)
+        site_var = ctk.StringVar(value=self.ref_site if self.ref_site in REFERENCE_SITES else "YouTube")
+        ctk.CTkSegmentedButton(win, values=list(REFERENCE_SITES), variable=site_var).pack(pady=8)
+        msg = ctk.CTkLabel(win, text="", text_color="#9DA7B3")
+        msg.pack()
+
+        def go(event=None):
+            query = entry.get().strip()
+            if not query:
+                msg.configure(text="Type something to search first.")
+                return
+            self.ref_site = site_var.get()
+            url = build_reference_url(query, self.ref_site)
+            kind, proc = open_reference(url, f"{self.ref_site}: {query}"[:60])
+            if proc is not None:
+                self.ref_procs.append(proc)
+            msg.configure(text="Opened in a reference window." if kind == "window"
+                          else "Opened in your browser (pip install pywebview for an in-app window).")
+
+        ctk.CTkButton(win, text="Search", command=go).pack(pady=8)
+        entry.bind("<Return>", go)
+        win.after(200, entry.focus_force)
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -1148,6 +1364,19 @@ class ModernAirCanvas:
                                 "Tesseract.\nReason: " + self.reader.error +
                                 "\n\nRun 'python air_canvas_pro.py --check' for full diagnostics.")
 
+    def _save_debug_pages(self, lines):
+        """Saves what the model is shown. One line: the three renderings
+        (ai_fix_debug_input / _thin / _thick). Several lines: ai_fix_debug_line<N>.png."""
+        folder = os.getcwd()
+        if len(lines) == 1:
+            names = ["ai_fix_debug_input.png", "ai_fix_debug_input_thin.png", "ai_fix_debug_input_thick.png"]
+            for name, page in zip(names, lines[0]["pages"]):
+                cv2.imwrite(os.path.join(folder, name), page)
+        else:
+            for i, line in enumerate(lines, 1):
+                cv2.imwrite(os.path.join(folder, f"ai_fix_debug_line{i}.png"), line["pages"][0])
+        print("AI FIX debug images saved to:", folder)
+
     def process_handwriting_with_ai(self):
         try:
             with self.canvas_lock:
@@ -1163,34 +1392,28 @@ class ModernAirCanvas:
 
             # Prefer the recorded fingertip path (clean vector data). If the
             # eraser or shapes were used, the path no longer matches the canvas,
-            # so fall back to the bitmap.
+            # so fall back to the bitmap. The writing is split into text lines.
             use_strokes = sum(len(s) for s in strokes_snapshot) >= 2
-            pages = []
-            for thickness, smooth_iters in VLM_RENDER_VARIANTS:
-                if use_strokes:
-                    page = render_strokes_page(strokes_snapshot, thickness, smooth_iters)
-                else:
-                    page = render_bitmap_page(thresh, self.brush_thickness, thickness)
-                if page is not None:
-                    pages.append(page)
-            if not pages:
+            lines = build_line_pages(strokes_snapshot, thresh, use_strokes, self.brush_thickness)
+            if not lines:
                 self.show_ai_status("Nothing to recognize - write something on the canvas first.")
                 return
+            n = len(lines)
 
             print(f"[AI FIX] input from {'recorded strokes' if use_strokes else 'canvas bitmap'}; "
-                  f"{len(pages)} renderings, page {pages[0].shape[1]}x{pages[0].shape[0]}")
-
+                  f"{n} line(s), rows " + ", ".join(f"{l['band'][0]}-{l['band'][1]}" for l in lines))
             if self.DEBUG_SAVE_OCR_INPUT:
-                names = ["ai_fix_debug_input.png", "ai_fix_debug_input_thin.png", "ai_fix_debug_input_thick.png"]
-                for name, page in zip(names, pages):
-                    cv2.imwrite(os.path.join(os.getcwd(), name), page)
-                print("AI FIX debug images saved to:", os.getcwd())
+                self._save_debug_pages(lines)
 
-            result, vlm_answered = None, False
+            results, vlm_answered = [], False
             if self.reader.ensure_loaded():
-                self.show_ai_status("Reading your handwriting...")
                 try:
-                    result = self.reader.read(pages)
+                    for i, line in enumerate(lines, 1):
+                        self.show_ai_status("Reading your handwriting..." if n == 1
+                                            else f"Reading line {i} of {n}...")
+                        if n > 1:
+                            print(f"[AI FIX] --- line {i} of {n} ---")
+                        results.append(self.reader.read(line["pages"], fast=(n > 1)))
                     vlm_answered = True
                 except Exception as e:
                     traceback.print_exc()
@@ -1200,43 +1423,68 @@ class ModernAirCanvas:
 
             if vlm_answered:
                 engine_used = "qwen2.5-vl"
-                raw_text = result["text"] if result else ""
-                avg_conf = result["token_conf"] if result else -1.0   # model's own certainty
+                texts = [r["text"] if r else "" for r in results]
+                confs = [r["token_conf"] for r in results if r]
             else:
-                # Qwen unavailable or crashed: weak Tesseract fallback
+                # Qwen unavailable or crashed: weak Tesseract fallback, line by line
                 engine_used = "tesseract"
-                raw_text, avg_conf = self.run_ocr_best_effort(pages[0])
+                texts, confs = [], []
+                for line in lines:
+                    t, c = self.run_ocr_best_effort(line["pages"][0])
+                    texts.append(t)
+                    if t:
+                        confs.append(c)
+            avg_conf = sum(confs) / len(confs) if confs else -1.0
+            raw_text = "\n".join(t for t in texts if t)
+            skipped = sum(1 for t in texts if not t)
 
-            print(f"[AI FIX] engine={engine_used} result='{raw_text}' conf={avg_conf:.1f}")
+            print(f"[AI FIX] engine={engine_used} result={raw_text!r} conf={avg_conf:.1f}")
 
             if not raw_text:
                 self.show_ai_status("Couldn't read that. Try writing bigger and slower with clear gaps "
-                                    "between letters, and check ai_fix_debug_input.png to see what "
-                                    "the AI is looking at."
+                                    "between letters, and check ai_fix_debug_input.png (or "
+                                    "ai_fix_debug_line1.png...) to see what the AI is looking at."
                                     + ("" if vlm_answered else f"\n(Qwen unavailable: {self.reader.error})"))
                 return
 
             # Autocorrect only for Tesseract; it would ruin names from the VLM.
-            corrected_text = str(TextBlob(raw_text).correct()) if engine_used == "tesseract" else raw_text
-            snaps = []
-            if engine_used != "tesseract" and self.vocabulary:
-                corrected_text, snaps = snap_to_vocabulary(corrected_text, self.vocabulary)
+            # The optional word list is applied to every line separately.
+            final_lines, snaps = [], []
+            for t in texts:
+                if not t:
+                    continue
+                if engine_used == "tesseract":
+                    t = str(TextBlob(t).correct())
+                elif self.vocabulary:
+                    t, s = snap_to_vocabulary(t, self.vocabulary)
+                    snaps += s
+                final_lines.append(t)
+            corrected_text = "\n".join(final_lines)
 
             note, extra = "", ""
             if engine_used == "tesseract":
                 note = f" (Tesseract fallback - Qwen failed to load: {self.reader.error[:300]})"
             else:
-                extra = (f"{result['votes']} of {result['valid']} readable readings gave this answer"
-                         + (f" ({result['empty']} judged unreadable)" if result["empty"] else "")
-                         + " - agreement is not the same as being correct")
-                if result["alternatives"]:
-                    extra += " · other readings: " + ", ".join(result["alternatives"])
+                if n == 1:
+                    r = results[0]
+                    extra = (f"{r['votes']} of {r['valid']} readable readings gave this answer"
+                             + (f" ({r['empty']} judged unreadable)" if r["empty"] else "")
+                             + " - agreement is not the same as being correct")
+                    if r["alternatives"]:
+                        extra += " · other readings: " + ", ".join(r["alternatives"])
+                else:
+                    per_line = ", ".join(f"{i}: {r['token_conf']:.0f}%" if r else f"{i}: unreadable"
+                                         for i, r in enumerate(results, 1))
+                    extra = f"{n} lines read separately · model certainty per line - {per_line}"
+                    if skipped:
+                        extra += f" · {skipped} unreadable line(s) skipped"
                 if snaps:
                     extra += " · matched to your word list: " + ", ".join(f"{a} -> {b}" for a, b in snaps)
                 if avg_conf < 50:
                     note = " (low model certainty - write bigger/slower, with gaps between letters)"
 
             self.render_ai_text(corrected_text)
+            self.last_ai_text = " ".join(corrected_text.split())
             self.update_ai_textbox(raw_text, corrected_text + note, avg_conf, engine_used, extra)
 
             # Handwriting is now clean text: clear the strokes, the recorded
@@ -1255,33 +1503,56 @@ class ModernAirCanvas:
         finally:
             self.is_ai_processing = False
 
-    def render_ai_text(self, text, font_size=42, max_width_chars=34):
-        """Draws the recognized text as a large, wrapped block with a solid
-        backdrop onto text_canvas, so it's clearly legible on the video feed
-        (not tiny, not overlapping old strokes, not clipped)."""
+    def render_ai_text(self, text, font_size=42):
+        """Draws the recognized text as a wrapped block with a solid backdrop
+        onto text_canvas so it is legible on the video feed. Many lines make
+        the font shrink so the block always fits on the screen."""
         with self.canvas_lock:
             base = self.text_canvas.copy()
 
         img_pil = Image.fromarray(cv2.cvtColor(base, cv2.COLOR_BGR2RGB)).convert("RGBA")
         draw = ImageDraw.Draw(img_pil)
 
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except Exception:
-            font = ImageFont.load_default()
+        def load_font(size):
+            try:
+                return ImageFont.truetype("arial.ttf", size)
+            except Exception:
+                return ImageFont.load_default()
 
-        wrapped_lines = []
-        for part in text.splitlines() or [text]:
-            wrapped_lines.extend(textwrap.wrap(part, width=max_width_chars) or [""])
-        if not wrapped_lines:
-            wrapped_lines = [text]
+        def text_w(s, font, size):
+            try:
+                return draw.textlength(s, font=font)
+            except Exception:
+                return len(s) * size * 0.55
 
-        line_height = font_size + 14
+        def wrap(font, size, max_w):
+            out = []
+            for part in (text.splitlines() or [text]):
+                cur = ""
+                for word in part.split(" "):
+                    trial = word if not cur else cur + " " + word
+                    if not cur or text_w(trial, font, size) <= max_w:
+                        cur = trial
+                    else:
+                        out.append(cur)
+                        cur = word
+                out.append(cur)
+            return out or [""]
+
         block_width = min(self.w - 100, 900)
-        block_height = line_height * len(wrapped_lines) + 30
-
         start_x = 50
         start_y = 130  # sits just below the button dock
+        max_block_h = self.h - start_y - 30
+
+        size = font_size
+        while True:
+            font = load_font(size)
+            wrapped_lines = wrap(font, size, block_width - 30)
+            line_height = size + 14
+            block_height = line_height * len(wrapped_lines) + 30
+            if block_height <= max_block_h or size <= 18:
+                break
+            size -= 4
 
         # Solid-ish backdrop so the text is readable over any camera/slide content
         draw.rounded_rectangle(
@@ -1412,6 +1683,11 @@ class ModernAirCanvas:
     def on_close(self):
         if self.is_recording:
             self.stop_recording()
+        for proc in self.ref_procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         self.cap.release()
         self.root.destroy()
 
