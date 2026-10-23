@@ -46,3 +46,5 @@ sounddevice
 imageio-ffmpeg
 torch
 transformers
+
+pip install pywebview
