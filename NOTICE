@@ -1,0 +1,87 @@
+Air Canvas — Third-Party Notices
+==================================
+
+This project includes or depends upon the following third-party software.
+Each component retains its own copyright and license.
+
+------------------------------------------------------------------------
+1. OpenCV (opencv-python)
+   License: Apache 2.0
+   Copyright: © Intel Corporation, OpenCV contributors
+   Source: https://github.com/opencv/opencv
+
+2. MediaPipe
+   License: Apache 2.0
+   Copyright: © Google LLC
+   Source: https://github.com/google/mediapipe
+
+3. NumPy
+   License: BSD 3-Clause
+   Copyright: © NumPy contributors
+   Source: https://numpy.org
+
+4. Pillow (PIL)
+   License: Historical Permission Notice and Disclaimer (HPND)
+   Copyright: © Jeffrey A. Clark (Alex) and contributors
+   Source: https://python-pillow.org
+
+5. CustomTkinter
+   License: MIT
+   Copyright: © Tom Schimansky
+   Source: https://github.com/TomSchimansky/CustomTkinter
+
+6. PyTesseract + Tesseract OCR
+   License: Apache 2.0
+   Copyright: © Google LLC, Samuel Hoffstaetter
+   Source: https://github.com/tesseract-ocr/tesseract
+
+7. SoundDevice
+   License: MIT
+   Copyright: © Matthias Geier
+   Source: https://python-sounddevice.readthedocs.io
+
+8. imageio-ffmpeg / FFmpeg
+   License: BSD 2-Clause (imageio-ffmpeg) + LGPL 2.1+ (FFmpeg)
+   Copyright: © imageio contributors, FFmpeg contributors
+   Source: https://ffmpeg.org
+
+9. TextBlob
+   License: MIT
+   Copyright: © Steven Loria
+   Source: https://textblob.readthedocs.io
+
+10. PyTorch (torch, torchvision)
+    License: BSD 3-Clause
+    Copyright: © Meta AI, PyTorch contributors
+    Source: https://pytorch.org
+
+11. Hugging Face Transformers
+    License: Apache 2.0
+    Copyright: © Hugging Face Inc.
+    Source: https://github.com/huggingface/transformers
+
+12. Accelerate
+    License: Apache 2.0
+    Copyright: © Hugging Face Inc.
+    Source: https://github.com/huggingface/accelerate
+
+13. BitsAndBytes
+    License: MIT
+    Copyright: © Tim Dettmers and contributors
+    Source: https://github.com/TimDettmers/bitsandbytes
+
+14. pywebview
+    License: BSD 3-Clause
+    Copyright: © Roman Miroshnychenko
+    Source: https://pywebview.flowrl.com
+
+------------------------------------------------------------------------
+AI Model Weights
+
+Qwen2.5-VL-3B-Instruct
+  License: Apache 2.0
+  Provider: Alibaba Cloud (Qwen Team)
+  Model Card: https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct
+  Note: Model weights are downloaded at runtime from Hugging Face Hub.
+        Users must comply with Alibaba Cloud's Apache 2.0 model license.
+------------------------------------------------------------------------
