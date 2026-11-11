@@ -1,3 +1,31 @@
+# =============================================================================
+# Air Canvas — Virtual Air Drawing Application (Modern / Pro Edition)
+#
+# Copyright (c) 2026  Amrit Noor Singh & Aryan Gupta
+# ALL RIGHTS RESERVED. PROPRIETARY AND CONFIDENTIAL.
+#
+# UNAUTHORIZED COPYING, USE, MODIFICATION, DISTRIBUTION, OR REPRODUCTION
+# OF THIS SOFTWARE OR ANY PORTION THEREOF — IN WHOLE OR IN PART — IS
+# STRICTLY PROHIBITED WITHOUT THE EXPRESS PRIOR WRITTEN PERMISSION OF
+# THE COPYRIGHT OWNERS.
+#
+# This software and its source code constitute confidential and proprietary
+# intellectual property of Amrit Noor Singh and Aryan Gupta.
+# Access to this file does not grant any license or right to use it.
+#
+# Any unauthorized use will result in immediate legal action under the
+# Indian Copyright Act, 1957 and applicable international IP law,
+# including civil claims for damages and injunctive relief.
+#
+# To request permission:
+#   Owners  : Amrit Noor Singh & Aryan Gupta
+#   Email   : amritnoorsingh8@gmail.com
+#   Phone   : +91-9877093547 | +91-9216812421
+#   Country : India
+#
+# See LICENSE file for full terms. See NOTICE for third-party attributions.
+# =============================================================================
+
 import cv2
 import mediapipe as mp
 import numpy as np
