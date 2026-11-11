@@ -1,31 +1,29 @@
 # =============================================================================
 # Air Canvas — Virtual Air Drawing Application (Modern / Pro Edition)
-# Copyright (c) 2026 [Your Full Name] <your@email.com>
 #
-# SPDX-FileCopyrightText: 2026 [Your Full Name]
-# SPDX-License-Identifier: MIT
+# Copyright (c) 2026  Amrit Noor Singh & Aryan Gupta
+# ALL RIGHTS RESERVED. PROPRIETARY AND CONFIDENTIAL.
 #
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
+# UNAUTHORIZED COPYING, USE, MODIFICATION, DISTRIBUTION, OR REPRODUCTION
+# OF THIS SOFTWARE OR ANY PORTION THEREOF — IN WHOLE OR IN PART — IS
+# STRICTLY PROHIBITED WITHOUT THE EXPRESS PRIOR WRITTEN PERMISSION OF
+# THE COPYRIGHT OWNERS.
 #
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
+# This software and its source code constitute confidential and proprietary
+# intellectual property of Amrit Noor Singh and Aryan Gupta.
+# Access to this file does not grant any license or right to use it.
 #
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-# =============================================================================
+# Any unauthorized use will result in immediate legal action under the
+# Indian Copyright Act, 1957 and applicable international IP law,
+# including civil claims for damages and injunctive relief.
 #
-# Third-party AI model: Qwen2.5-VL-3B-Instruct (Alibaba Cloud, Apache 2.0)
-# See NOTICE file for full third-party attribution list.
+# To request permission:
+#   Owners  : Amrit Noor Singh & Aryan Gupta
+#   Email   : amritnoorsingh8@gmail.com
+#   Phone   : +91-9877093547 | +91-9216812421
+#   Country : India
+#
+# See LICENSE file for full terms. See NOTICE for third-party attributions.
 # =============================================================================
 
 import cv2
